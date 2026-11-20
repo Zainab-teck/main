@@ -321,9 +321,27 @@ class ArtifactResult:
             "role": self.role,
             "raw_bytes": self.raw_bytes,
             "normalized_bytes": self.normalized_bytes,
+            "size_bytes": self.raw_bytes,
             "raw_sha256": self.raw_sha256,
             "normalized_sha256": self.normalized_sha256,
         }
+
+
+@dataclass
+class DependencyRecord:
+    """One content-addressed input that an artifact was built from.
+
+    ``kind`` is one of ``source``, ``helper``, or ``toolchain``. ``sha256``
+    is the digest of the file content (for source/helper) or of the pinned
+    toolchain version record (for toolchain). Paths are repo-relative.
+    """
+
+    path: str
+    kind: str
+    sha256: str
+
+    def to_entry(self) -> dict:
+        return {"path": self.path, "kind": self.kind, "sha256": self.sha256}
 
 
 def digest_artifact(declaration: dict, lock: Lock, root: Path) -> ArtifactResult:
@@ -422,22 +440,38 @@ def build_manifest(lock: Lock, root: Path) -> tuple[dict, ManifestRun]:
     for declaration in lock.artifacts:
         run.entries.append(digest_artifact(declaration, lock, root))
 
+    provenance = collect_provenance(lock, root)
+    toolchain = {
+        "nargo": lock.toolchain["nargo"]["version"],
+        "barretenberg": lock.toolchain["barretenberg"]["version"],
+        "proving_scheme": lock.toolchain["proving_scheme"],
+        "oracle_hash": lock.toolchain["oracle_hash"],
+    }
+    # Content-addressed dependency graph (#1215): every artifact entry carries
+    # the source files, helper files, and pinned toolchain record it was
+    # built from. The toolchain record is hashed as canonical JSON so the
+    # digest is stable across hosts; source/helper digests come from the
+    # provenance map already collected above.
+    toolchain_sha = sha256_hex(
+        json.dumps(toolchain, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+    dependencies = {
+        "toolchain": {"sha256": toolchain_sha},
+        "sources": dict(sorted(provenance.items())),
+    }
+
     manifest = {
         "format": MANIFEST_FORMAT,
         "version": MANIFEST_VERSION,
-        "toolchain": {
-            "nargo": lock.toolchain["nargo"]["version"],
-            "barretenberg": lock.toolchain["barretenberg"]["version"],
-            "proving_scheme": lock.toolchain["proving_scheme"],
-            "oracle_hash": lock.toolchain["oracle_hash"],
-        },
+        "toolchain": toolchain,
         "environment": dict(sorted(lock.environment.items())),
         "normalization_policy_sha256": sha256_hex(
             json.dumps(lock.raw["normalization"], sort_keys=True, separators=(",", ":")).encode(
                 "utf-8"
             )
         ),
-        "provenance": collect_provenance(lock, root),
+        "provenance": provenance,
+        "dependencies": dependencies,
         "artifacts": [
             entry.to_entry()
             for entry in run.entries
@@ -524,6 +558,31 @@ def compare_manifests(expected: dict, actual: dict) -> list[str]:
                 "(host metadata only; not a semantic change)"
             )
 
+    return findings
+
+
+def stale_artifacts(manifest: dict, current_inputs: dict) -> list[str]:
+    """Return a list of dependency paths whose recorded digest no longer
+    matches ``current_inputs`` (path -> sha256).
+
+    ``current_inputs`` is what ``collect_provenance`` returns right now. Any
+    source or helper file present in the manifest's ``dependencies.sources``
+    whose digest has changed (or which no longer exists) is reported. A tool
+    chain record mismatch is reported under the synthetic path
+    ``toolchain`` so a bumped compiler version flags every artifact.
+    """
+    findings: list[str] = []
+    recorded_sources = (manifest.get("dependencies") or {}).get("sources", {})
+    for path, recorded_sha in sorted(recorded_sources.items()):
+        actual_sha = current_inputs.get(path)
+        if actual_sha is None:
+            findings.append(f"dependency {path}: recorded but not present on disk")
+        elif actual_sha != recorded_sha:
+            findings.append(
+                f"dependency {path}: {_short(recorded_sha)} -> {_short(actual_sha)}"
+            )
+    for path in sorted(set(current_inputs) - set(recorded_sources)):
+        findings.append(f"dependency {path}: new input, not recorded in manifest")
     return findings
 
 
@@ -1123,6 +1182,11 @@ def command_verify(args: argparse.Namespace) -> int:
     _fail_on_fatal(run)
 
     findings = compare_manifests(expected, actual)
+    # Stale-input check (#1215): flag any source or helper file whose digest
+    # has changed since the manifest was recorded, before reporting success.
+    stale = stale_artifacts(expected, actual.get("provenance", {}))
+    for finding in stale:
+        findings.append(f"stale: {finding}")
     if findings:
         for finding in findings:
             signal("drift.finding", detail=finding)

@@ -404,6 +404,10 @@ def cmd_build(
 
     if mode == "verify":
         build_all_circuits("verify", toolchain, repo_root=repo_root, runner=runner)
+        # Pre-package stale-dependency check (#1215): a source or helper
+        # whose digest changed since the manifest was recorded makes the
+        # derived artifact stale. The manifest tool's verify command
+        # reports this; we surface the same signal here before packaging.
         status = run_manifest_tool(
             ["--lock", str(lock_path), "verify", "--manifest", str(manifest_path)],
             repo_root=repo_root,
